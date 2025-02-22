@@ -12,7 +12,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-
+import time
+import tiktoken
 
 
 @dataclass
@@ -36,6 +37,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd) 
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1 # let our std inside the residual stream normalized
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -66,9 +68,11 @@ class MLP(nn.Module):
     
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd) # fc: fully connected cell
-        self.gelu = nn.GELU() # GELU activation function
+        self.c_fc   = nn.Linear(config.n_embd, 4 * config.n_embd) # fc: fully connected cell
+        self.gelu   = nn.GELU() # GELU activation function
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd) # projection layer
+        self.c_proj.NANOGPT_SCALE_INIT = 1 # let our std inside the residual stream normalized
+
         
     def forward(self, x):
         x = self.c_fc(x)
@@ -106,6 +110,23 @@ class GPT2(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False) # final classifier
         
+        # weight sharing scheme(from Attention is all you need, where we share same weight matrix between pre-softmax layer(lme_head) and embedding layer(wte))
+        self.transformer.wte.weight = self.lm_head.weight
+        
+        # init parameters
+        self.apply(self._init_weights)
+        
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, "NANOGPT_SCALE_INIT"):
+                std *= (2 * self.config.n_layer) ** -0.5 # multiply by 2, because of every single of layers in transformer has 2 blocks that add to residual pathway(MLP and attn)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    
     def forward(self, idx, targets=None):
         # idx: [batch_size, sequence_length] = [B, T]
         B, T = idx.size()
@@ -174,7 +195,39 @@ class GPT2(nn.Module):
                     sd[k].copy_(sd_hf[k])
 
         return model
+    
+#----------------------------------------------------------
+# data loader 
 
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+        
+        # at init load tokens from disk and store them in memory
+        with open("data/input.txt", "r") as f:
+            text = f.read()
+        enc = tiktoken.get_encoding("gpt2")
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        print(f"Loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
+        
+        # state
+        self.current_position = 0
+        
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position : self.current_position + B*T + 1]
+        x = (buf[:-1]).view(B, T) # inputs
+        y = (buf[1:]).view(B, T) # targets
+        # advance the position in the tensor
+        self.current_position += B*T
+        # if loading next batch would overflow the buffer, reset the position
+        if self.current_position + (B * T + 1) > len(self.tokens):
+            self.current_position = 0
+        return x, y
+    
 
 #----------------------------------------------------------
 # Autodetection of device (cuda, mps, cpu)
@@ -186,30 +239,52 @@ elif hasattr(torch.backends,"mps") and torch.backends.mps.is_initialized():
 print(f"Using device: {device}")
 
 #----------------------------------------------------------
-# get a data batch
-import tiktoken
-enc = tiktoken.get_encoding("gpt2")
-with open("data/input.txt", "r") as f:
-    text = f.read()
-text = text[:1000]
-tokens = enc.encode(text)
-B, T = 4, 32
-buf = torch.tensor(tokens[:B*T + 1], dtype=torch.long).to(device)
-x = buf[:-1].view(B, T)
-y = buf[1:].view(B, T)
+# reproducibility
+torch.manual_seed(42)
+if torch.cuda.is_available:
+    torch.cuda.manual_seed(42)
+
+#----------------------------------------------------------
+train_loader = DataLoaderLite(B=16, T=1024) # B - batch size, T - max sequence length
+
+# transforming datatype of floatpoint(fp32) to tensorfloat(tf32)
+""" 
+**notes** 
+on my 3080 ti gpu
+after tests there is no significant boost in perfomance between fp32 and tf32,
+fp32 - avg dt:14166.99ms-22000.00ms, tok/sec:1079.75-1156.49
+tf32 - avg dt:15153.53ms-22892.89ms, tok/sec:715.68-1081.20
+but using bfloat16 has a significant boost(+30%)
+bfloat16 - avg dt: 10888.44ms-12218.30ms, tok/sec:1447.49-1578.88
+"""
+torch.set_float32_matmul_precision("high")
 
 # get logits
-# model = GPT2.from_pretrained('gpt2')
 model = GPT2(Config())
 model.to(device)
-# logits, loss = model(x, y)
+# model = torch.compile(model)
+# cannot use torch.compile on Windows OS, beacause
+# running TorchInductor requires Triton(torchtriton), 
+# that only support Linux OS, so as compromiss
+# we can use Windows Subsystem for Linux
+
+
+# optimization
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(50):
+for i in range(10):
+    t0 = time.time()
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16): # autocast should wrap only the forward pass(es) of your network, including the loss computation(s). Backward passes under autocast are not recommended.
+        logits, loss = model(x, y) 
     loss.backward()
     optimizer.step()
-    print(f"step {i}, loss: {loss.item()}")
+    torch.cuda.synchronize() # Wait for all kernels in all streams on a CUDA device to complete.
+    t1 = time.time()
+    dt = (t1 - t0)*1000 # time diff in milisec
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec:{tokens_per_sec:.2f}")
     
 
 
@@ -226,8 +301,6 @@ x = tokens.to(device)
 
 # generate text
 # right now x is (B, T), where B is batch = 5, T is time = 8
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
 while x.size(1) < max_length:
     # forward the nodel to get logits
     with torch.no_grad():
