@@ -1,6 +1,6 @@
 """
 Decoder-only transformer model for language modeling.
-Replicating OpenAI GPT2 model from scratch using PyTorch.
+Replicating OpenAI GPT2 model from scratch using PyTorch.(Inference model, not the training one)
 Main difference between nanoGPT and nanoGPT2 is that GPT2 
 uses LayerNorm instead of BatchNorm, and also 
 moved to the input of each sub-block, and an additional layer normalization 
@@ -14,7 +14,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 import time
 import tiktoken
-
+import inspect
 
 @dataclass
 class Config:
@@ -53,12 +53,17 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, self.n_embd // self.n_head).transpose(1, 2) # (B, n_head, T, head_size)
         q = q.view(B, T, self.n_head, self.n_embd // self.n_head).transpose(1, 2) # (B, n_head, T, head_size)
         v = v.view(B, T, self.n_head, self.n_embd // self.n_head).transpose(1, 2) # (B, n_head, T, head_size)
+        
         # attention (materializes the large(T, T) matrix for all the queries and keys)
         # in official gpt2 used `torch.baddbmm`- batch matrix-matrix product of matrice (it is a bit more efficient)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float("-inf"))
-        att = F.softmax(att, dim=-1)
-        y = att @ v # (B, n_head, T, T) @ (B, n_head, T, hs) -> (B, n_head, T, hs) weighted sum of the tokens that model found interesting
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float("-inf"))
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v # (B, n_head, T, T) @ (B, n_head, T, hs) -> (B, n_head, T, hs) weighted sum of the tokens that model found interesting
+        
+        # instead we implement Flash Attention to improve speed of the model
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
         y = self.c_proj(y)
@@ -196,6 +201,30 @@ class GPT2(nn.Module):
 
         return model
     
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        # start all of the candidate parameters(that reqiure grad)
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2d will be weight decayed, otherwise no
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2] # decay weights that participate in matmuls and embeddings
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2] # nodecay 1Dim parameters like biases and layernorms
+        optim_groups = [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": nodecay_params, "weight_decay": 0.0}
+        ] 
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # create AdamW optimizer and use the fused version if its available
+        # fused - instead of iterating in a for-loop all parameter tensors, we fusing all kernels into a single kernel and update all the params in single time
+        fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters 
+        use_fused = fused_available and "cuda" in device
+        print(f"Using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        
+        return optimizer
 #----------------------------------------------------------
 # data loader 
 
@@ -248,30 +277,42 @@ if torch.cuda.is_available:
 train_loader = DataLoaderLite(B=16, T=1024) # B - batch size, T - max sequence length
 
 # transforming datatype of floatpoint(fp32) to tensorfloat(tf32)
-""" 
-**notes** 
-on my 3080 ti gpu
-after tests there is no significant boost in perfomance between fp32 and tf32,
-fp32 - avg dt:14166.99ms-22000.00ms, tok/sec:1079.75-1156.49
-tf32 - avg dt:15153.53ms-22892.89ms, tok/sec:715.68-1081.20
-but using bfloat16 has a significant boost(+30%)
-bfloat16 - avg dt: 10888.44ms-12218.30ms, tok/sec:1447.49-1578.88
-"""
 torch.set_float32_matmul_precision("high")
 
 # get logits
-model = GPT2(Config())
+model = GPT2(Config(vocab_size=50304)) # increasing vocab_size to 50304 because its nice num and can be devided by 2(128)
 model.to(device)
 # model = torch.compile(model)
+
 # cannot use torch.compile on Windows OS, beacause
 # running TorchInductor requires Triton(torchtriton), 
 # that only support Linux OS, so as compromiss
 # we can use Windows Subsystem for Linux
 
+# cosine decay learning rate scheduler
+# we decay the learning rate with a cosine annealing for each batch as follows:
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 10
+def get_lr(it):
+    # 1) linear warmup for warmup_iters steps
+    if it < warmup_steps:
+        return max_lr * (it+1) / warmup_steps
+    # 2) if it > lr_decay_iter, return min learning rate
+    if it > max_steps:
+        return min_lr
+    # 3) in between, use cosine decay down to min learning rate
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coef start at 1 and goes to 0
+    return min_lr + coeff * (max_lr - min_lr)
 
 # optimization
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(10):
+# using some OpenAI GPT-3 parameters that was in their released paper 
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+
+for step in range(max_steps):
     t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
@@ -279,12 +320,17 @@ for i in range(10):
     with torch.autocast(device_type=device, dtype=torch.bfloat16): # autocast should wrap only the forward pass(es) of your network, including the loss computation(s). Backward passes under autocast are not recommended.
         logits, loss = model(x, y) 
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # we clip the global norm of the grad 1.0, to prevent the model getting too big of shocks in terms of gradient magnitude
+    # determine and set the learning rate for this iteration
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr
     optimizer.step()
     torch.cuda.synchronize() # Wait for all kernels in all streams on a CUDA device to complete.
     t1 = time.time()
     dt = (t1 - t0)*1000 # time diff in milisec
     tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec:{tokens_per_sec:.2f}")
+    print(f"step {step} | loss: {loss.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
     
 
 
@@ -324,3 +370,29 @@ for i in range(num_return_sequences):
     tokens = x[i, :max_length].tolist()
     decoded = enc.decode(tokens)
     print(">", decoded)
+
+""" 
+**notes** 
+on my 3080 ti gpu
+-after tests there is no significant boost in perfomance between fp32 and tf32,
+fp32 => avg dt:14166.99ms-22000.00ms, tok/sec:1079.75-1156.49
+tf32 => avg dt:15153.53ms-22892.89ms, tok/sec:715.68-1081.20
+-but using bfloat16 has a significant boost(+30%)
+bfloat16 => avg dt: 10888.44ms-12218.30ms, tok/sec:1447.49-1578.88
+
+-after imporoving our attention layer to Flash attention, 
+we can clearly see nearly x10 boost in speed of the model computations
+FlashAttetion => avg dt: 1289.38ms-1609.96ms, tok/sec:10176.66-12706.90
+
+-after correcting our model configuration to "nice" numbers(can be devided by 2)
+because our spread of results in time and tok/sec, we cannot clearly see,
+but it seems that there is a small boost(+15%) in speed of the model computations
+vocab_size->50304 => avg dt: 1036.34ms-1413.23ms, tok/sec:12646.46-16315.44
+
+-after implementing cosine decay learning rate scheduler 
+to automatic calculate learning rate for our model
+lr_scheduler => lr: 6.0000e-04 | norm: 2.0514 | dt: 949.72ms | tok/sec: 17251.39
+
+-after adding weight decay regularization and FusedKernel AdamW
+weight_decay, FusedAdamW => lr: 4.8000e-04 | norm: 2.5717 | dt: 952.17ms | tok/sec: 17207.01
+"""
