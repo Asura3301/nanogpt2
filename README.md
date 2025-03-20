@@ -31,6 +31,33 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
+To use and train our nanoGPT2 with your local machine(GPU). You first need to install PyTorch with CUDA support. You can follow these instructions:
+
+### Installation Instructions for PyTorch with CUDA
+
+
+1. **Install CUDA Toolkit:**
+   Download and install the CUDA Toolkit from the [CUDA Toolkit page](https://developer.nvidia.com/cuda-toolkit). Follow the installation instructions specific to your operating system.
+
+2. **Install PyTorch with CUDA:**
+   Use the following command to install PyTorch with CUDA support. Replace `x.x` with the appropriate CUDA version you have installed (e.g., `11.8`).
+
+   ```bash
+   # For CUDA 11.8
+   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+   ```
+
+   You can find the latest installation commands for different CUDA versions on the [PyTorch Get Started page](https://pytorch.org/get-started/locally/).
+
+3. **Verify Installation:**
+   To verify that PyTorch is using CUDA, run the following Python code:
+
+   ```python
+   import torch
+   print(torch.cuda.is_available())  # Should return True if CUDA is available
+   print(torch.cuda.get_device_name(0))  # Prints the name of your GPU
+   ```
+
 ## Model Architecture
 
 The implementation follows the original GPT-2 architecture:
@@ -123,3 +150,8 @@ MIT
 ---
 
 *Note: This implementation is for educational purposes and is a reference for understanding the GPT-2 architecture.*
+
+
+
+
+
