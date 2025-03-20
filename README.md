@@ -23,7 +23,11 @@ The key difference between this implementation (nanoGPT2) and the original [nano
 git clone https://github.com/Asura3301/nanogpt2.git
 cd nanogpt2
 
-# Install required packages
+# Create and activate a virtual environment (optional but recommended)
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# Install dependencies
 pip install -r requirements.txt
 ```
 
